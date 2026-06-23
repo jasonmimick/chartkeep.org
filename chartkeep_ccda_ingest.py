@@ -18,7 +18,7 @@ Original zip is always preserved at:
 """
 
 import hashlib, re, sys, zipfile, shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -449,6 +449,90 @@ def parse_doc(xml_bytes: bytes) -> dict | None:
     }
 
 
+# ── Provenance & document integrity ───────────────────────────────────────────
+
+# Trust tiers:
+#   verified  — fetched directly from a known EHR endpoint via SMART on FHIR
+#   imported  — user-provided file/ZIP; provenance unconfirmed
+#   flagged   — failed one or more integrity checks
+
+_KNOWN_ISSUERS = {
+    "epic",
+    "mychart",
+    "cerner",
+    "athenahealth",
+    "allscripts",
+    "meditech",
+    "nextgen",
+}
+
+_SIG_TAGS = [
+    "{http://www.w3.org/2000/09/xmldsig#}Signature",
+    "{urn:hl7-org:v3}signature",
+]
+
+
+def check_provenance(xml_bytes: bytes, root, source_zip: str) -> dict:
+    """
+    Analyze a C-CDA document and return provenance metadata.
+    Does NOT make pass/fail decisions — just captures everything observable
+    so future checks can act on it.
+    """
+    sha256 = hashlib.sha256(xml_bytes).hexdigest()
+    size   = len(xml_bytes)
+    ingest_ts = datetime.now(timezone.utc).isoformat()
+
+    # Digital signature present?
+    has_signature = any(root.find(tag) is not None for tag in _SIG_TAGS)
+
+    # Custodian / issuing organization
+    custodian_el = root.find(f".//{N('custodian')}//{N('name')}")
+    custodian    = custodian_el.text.strip() if custodian_el is not None and custodian_el.text else ""
+
+    # Detect known EHR issuer by custodian name
+    custodian_lower = custodian.lower()
+    known_issuer = any(k in custodian_lower for k in _KNOWN_ISSUERS)
+
+    # Structured author device (some EHRs embed software name)
+    device_el = root.find(f".//{N('author')}//{N('manufacturerModelName')}")
+    device    = device_el.text.strip() if device_el is not None and device_el.text else ""
+
+    # Creation timestamp from document header
+    created_el  = root.find(N("effectiveTime"))
+    doc_created = created_el.get("value", "") if created_el is not None else ""
+
+    # Assign trust tier
+    # "verified" reserved for direct FHIR pulls (not yet implemented)
+    # Documents with no signature and unknown custodian are still "imported" —
+    # "flagged" is reserved for active integrity failures caught by future checks
+    if has_signature:
+        trust = "imported+signed"
+    else:
+        trust = "imported"
+
+    return {
+        "trust":          trust,
+        "ingest_method":  "zip_upload",
+        "ingest_ts":      ingest_ts,
+        "source_zip":     source_zip,
+        "sha256":         sha256,
+        "size_bytes":     size,
+        "has_signature":  has_signature,
+        "custodian":      custodian,
+        "known_issuer":   known_issuer,
+        "device":         device,
+        "doc_created":    doc_created,
+    }
+
+
+TRUST_EMOJI = {
+    "verified":        "🟢",
+    "imported+signed": "🟡",
+    "imported":        "🟡",
+    "flagged":         "🔴",
+}
+
+
 # ── Note builder ───────────────────────────────────────────────────────────────
 
 def build_note(d: dict) -> str:
@@ -461,6 +545,10 @@ def build_note(d: dict) -> str:
         lines.append("")
         return lines
 
+    prov  = d.get("provenance", {})
+    trust = prov.get("trust", "imported")
+    emoji = TRUST_EMOJI.get(trust, "🟡")
+
     lines = [
         "---",
         f"id: encounter-{short(d['uid'])}",
@@ -469,6 +557,12 @@ def build_note(d: dict) -> str:
         f"provider: {d['provider']}",
         f"org: {d['org']}",
         f"source: encounter.ccda.xml",
+        f"trust: {trust}",
+        f"sha256: {prov.get('sha256', '')}",
+        f"ingest_ts: {prov.get('ingest_ts', '')}",
+        f"ingest_method: {prov.get('ingest_method', '')}",
+        f"has_signature: {str(prov.get('has_signature', False)).lower()}",
+        f"custodian: {prov.get('custodian', '')}",
         "---",
         "",
         f"# Visit — {d['date_human']}",
@@ -540,11 +634,14 @@ def main():
         created = skipped = 0
         for name in xml_files:
             xml_bytes = zf.read(name)
+            root_el = ET.fromstring(xml_bytes)
             d = parse_doc(xml_bytes)
             if d is None:
                 print(f"  ⚠  {Path(name).name}  — no encounter date, skipping")
                 skipped += 1
                 continue
+
+            d["provenance"] = check_provenance(xml_bytes, root_el, src.name)
 
             folder_name = f"{d['date']}-{d['provider'].split()[-1].lower()}-{short(d['uid'])}"
             out = base / folder_name
@@ -553,9 +650,12 @@ def main():
             (out / "note.md").write_text(build_note(d))
             (out / "encounter.ccda.xml").write_bytes(xml_bytes)
 
+            prov      = d["provenance"]
+            trust_ico = TRUST_EMOJI.get(prov["trust"], "🟡")
             lab_count = len(d["labs"])
-            print(f"  ✓  {d['date']}  {d['provider']:25}  {d['org'][:30]}"
-                  + (f"  [{lab_count} labs]" if lab_count else ""))
+            print(f"  {trust_ico}  {d['date']}  {d['provider']:25}  {d['org'][:30]}"
+                  + (f"  [{lab_count} labs]" if lab_count else "")
+                  + (f"  ✍ signed" if prov["has_signature"] else ""))
             created += 1
 
     print(f"\n{created} encounters written to {base}")
