@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""
+chartkeep_catalog.py — generate a personal health record index for your Chartkeep vault.
+Re-run after every CD ingest to refresh.
+
+Usage:
+    python3 chartkeep_catalog.py ./vault
+"""
+
+import json, sys
+from pathlib import Path
+from collections import defaultdict
+from datetime import datetime
+from xml.etree import ElementTree as ET
+
+NS = "urn:hl7-org:v3"
+N  = lambda tag: f"{{{NS}}}{tag}"
+
+
+MODALITY_LABEL = {
+    "CR": "X-Ray",
+    "DX": "X-Ray",
+    "CT": "CT Scan",
+    "MR": "MRI",
+    "US": "Ultrasound",
+    "PT": "PET Scan",
+    "RF": "Fluoroscopy",
+    "NM": "Nuclear Medicine",
+}
+
+MODALITY_EMOJI = {
+    "CR": "🦴", "DX": "🦴", "CT": "🔬", "MR": "🧲",
+    "US": "🔊", "PT": "☢️",  "RF": "📡",
+}
+
+
+def load_studies(vault: Path):
+    studies = []
+    for fhir_file in sorted((vault / "records" / "imaging").glob("*/resource.fhir.json")):
+        folder = fhir_file.parent
+        data   = json.loads(fhir_file.read_text())
+        previews = sorted((folder / "files").glob("*_preview.png"))
+
+        mods = [m["code"] for m in data.get("modality", [])]
+        series_list = data.get("series", [])
+
+        studies.append({
+            "folder":      folder.name,
+            "date":        data.get("started", ""),
+            "description": data.get("description", "") or "",
+            "modalities":  mods,
+            "series":      data.get("numberOfSeries", 0),
+            "images":      data.get("numberOfInstances", 0),
+            "previews":    previews,
+            "series_list": series_list,
+        })
+
+    studies.sort(key=lambda s: s["date"], reverse=True)
+    return studies
+
+
+def fmt_date_human(d: str) -> str:
+    try:
+        return datetime.strptime(d, "%Y-%m-%d").strftime("%B %-d, %Y")
+    except Exception:
+        return d
+
+
+def modality_label(mods: list) -> str:
+    labels = list(dict.fromkeys(MODALITY_LABEL.get(m, m) for m in mods))
+    return " / ".join(labels)
+
+
+def modality_icon(mods: list) -> str:
+    return MODALITY_EMOJI.get(mods[0], "📋") if mods else "📋"
+
+
+def clean_desc(desc: str) -> str:
+    """Make clinical shorthand a bit more readable."""
+    desc = desc.replace("^", " ").replace("WO CONTRAST", "without contrast")
+    desc = desc.replace("W CONTRAST", "with contrast").replace("W/O", "without")
+    return desc.strip().title()
+
+
+def embed(preview: Path, vault: Path) -> str:
+    rel = preview.relative_to(vault)
+    # Use forward slashes; no pipe-size-hint (avoids Obsidian table pipe bug)
+    return f"![[{str(rel).replace(chr(92), '/')}]]"
+
+
+def render_catalog(studies: list, vault: Path) -> str:
+    total_images = sum(s["images"] for s in studies)
+    mods = sorted({m for s in studies for m in s["modalities"]})
+    mod_labels = " · ".join(dict.fromkeys(MODALITY_LABEL.get(m, m) for m in mods))
+
+    oldest = studies[-1]["date"] if studies else ""
+    newest = studies[0]["date"]  if studies else ""
+
+    lines = [
+        "# My Health Records",
+        "",
+        f"> **Jason Mimick** &nbsp;·&nbsp; DOB 02/08/1973",
+        f"> {len(studies)} studies &nbsp;·&nbsp; {total_images:,} images &nbsp;·&nbsp; {mod_labels}",
+        f"> {fmt_date_human(oldest)} — {fmt_date_human(newest)}",
+        "",
+        "---",
+        "",
+    ]
+
+    by_year = defaultdict(list)
+    for s in studies:
+        year = s["date"][:4] if s["date"] else "Unknown"
+        by_year[year].append(s)
+
+    for year in sorted(by_year.keys(), reverse=True):
+        lines += [f"## {year}", ""]
+
+        for s in by_year[year]:
+            icon  = modality_icon(s["modalities"])
+            label = modality_label(s["modalities"])
+            desc  = clean_desc(s["description"]) or label
+            date  = fmt_date_human(s["date"])
+            note_link = f"[[{s['folder']}/note|→ open full record]]"
+
+            lines += [
+                f"### {icon} {desc}",
+                f"**{date}** &nbsp;·&nbsp; {label} &nbsp;·&nbsp; {s['series']} series · {s['images']:,} images &nbsp;·&nbsp; {note_link}",
+                "",
+            ]
+
+            if s["previews"]:
+                for p in s["previews"]:
+                    lines.append(embed(p, vault))
+                lines.append("")
+            else:
+                lines += ["_Preview not yet generated — run `chartkeep_previews.py` to add._", ""]
+
+            if s["series_list"]:
+                for ser in s["series_list"]:
+                    ser_desc = ser.get("description") or ""
+                    body     = ser.get("bodySite", {}).get("text", "") if ser.get("bodySite") else ""
+                    n        = ser.get("numberOfInstances", "?")
+                    parts    = [p for p in [ser_desc, body] if p]
+                    label_str = " — ".join(parts) if parts else "(unlabeled)"
+                    lines.append(f"- {label_str} ({n} images)")
+                lines.append("")
+
+            lines.append("---")
+            lines.append("")
+
+    lines += ["_Generated by `chartkeep_catalog.py` — re-run after each ingest to refresh._"]
+    return "\n".join(lines)
+
+
+def load_encounters(vault: Path) -> list:
+    enc_base = vault / "records" / "encounters"
+    if not enc_base.exists():
+        return []
+    encounters = []
+    for note in sorted(enc_base.glob("*/note.md")):
+        folder = note.parent
+        lines  = note.read_text().splitlines()
+        meta   = {}
+        in_fm  = False
+        for line in lines:
+            if line == "---":
+                if not in_fm:
+                    in_fm = True
+                    continue
+                else:
+                    break
+            if in_fm and ": " in line:
+                k, v = line.split(": ", 1)
+                meta[k.strip()] = v.strip()
+        encounters.append({
+            "folder":   folder.name,
+            "date":     meta.get("date", ""),
+            "provider": meta.get("provider", "Unknown"),
+            "org":      meta.get("org", ""),
+        })
+    encounters.sort(key=lambda e: e["date"], reverse=True)
+    return encounters
+
+
+def render_encounters(encounters: list) -> list:
+    if not encounters:
+        return []
+
+    lines = [
+        "---",
+        "",
+        "# Visit History",
+        "",
+        f"> {len(encounters)} encounters",
+        "",
+    ]
+
+    by_year = defaultdict(list)
+    for e in encounters:
+        year = e["date"][:4] if e["date"] else "Unknown"
+        by_year[year].append(e)
+
+    for year in sorted(by_year.keys(), reverse=True):
+        lines += [f"## {year}", ""]
+        for e in by_year[year]:
+            date   = fmt_date_human(e["date"])
+            link   = f"[[{e['folder']}/note|{e['provider']}]]"
+            org    = e["org"].title()
+            lines.append(f"- **{date}** — {link} &nbsp;·&nbsp; _{org}_")
+        lines.append("")
+
+    return lines
+
+
+def main():
+    vault = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("./vault")
+
+    studies    = load_studies(vault) if (vault / "records" / "imaging").exists() else []
+    encounters = load_encounters(vault)
+
+    if not studies and not encounters:
+        print("No records found in vault."); sys.exit(0)
+
+    content = render_catalog(studies, vault) if studies else ""
+    if encounters:
+        enc_lines = render_encounters(encounters)
+        content   = content + "\n" + "\n".join(enc_lines)
+
+    out = vault / "catalog.md"
+    out.write_text(content)
+    print(f"Catalog written → {out}  ({len(studies)} imaging studies, {len(encounters)} encounters)")
+
+
+if __name__ == "__main__":
+    main()

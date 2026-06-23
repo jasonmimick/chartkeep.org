@@ -1,0 +1,21 @@
+# Health records — never commit
+vault/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# Node
+app/frontend/node_modules/
+app/frontend/dist/
+
+# OS
+.DS_Store
+
+# Secrets
+.env
+*.env
+.claude/
